@@ -74,16 +74,24 @@ const sessionStats = {
     bytesIndexed: 0,
     bytesSandboxed: 0, // network I/O consumed inside sandbox (never enters context)
     sessionStart: Date.now(),
+    timing: {},
 };
-function trackResponse(toolName, response) {
+function trackResponse(toolName, response, durationMs) {
     const bytes = response.content.reduce((sum, c) => sum + Buffer.byteLength(c.text), 0);
     sessionStats.calls[toolName] = (sessionStats.calls[toolName] || 0) + 1;
     sessionStats.bytesReturned[toolName] =
         (sessionStats.bytesReturned[toolName] || 0) + bytes;
+    if (durationMs !== undefined)
+        trackTiming(toolName, durationMs);
     return response;
 }
 function trackIndexed(bytes) {
     sessionStats.bytesIndexed += bytes;
+}
+function trackTiming(toolName, durationMs) {
+    if (!sessionStats.timing[toolName])
+        sessionStats.timing[toolName] = [];
+    sessionStats.timing[toolName].push(durationMs);
 }
 // ==============================================================================
 // Security: server-side deny firewall
@@ -313,26 +321,28 @@ server.registerTool("cm_execute", {
             "\n\nTIP: Use specific technical terms, not just concepts. Check 'Searchable terms' in the response for available vocabulary."),
     }),
 }, async ({ language, code, timeout, background, intent }) => {
-    // Security: deny-only firewall
-    if (language === "shell") {
-        const denied = checkDenyPolicy(code, "execute");
-        if (denied)
-            return denied;
-    }
-    else {
-        const denied = checkNonShellDenyPolicy(code, language, "execute");
-        if (denied)
-            return denied;
-    }
+    const _t0 = Date.now();
     try {
-        // For JS/TS: wrap in async IIFE with fetch + http/https interceptors to track network bytes
-        let instrumentedCode = code;
-        if (language === "javascript" || language === "typescript") {
-            // Wrap user code in a closure that shadows CJS require with http/https interceptor.
-            // globalThis.require does NOT work because CJS require is module-scoped, not global.
-            // The closure approach (function(__cm_req){ var require=...; })(require) correctly
-            // shadows the CJS require for all code inside, including __cm_main().
-            instrumentedCode = `
+        // Security: deny-only firewall
+        if (language === "shell") {
+            const denied = checkDenyPolicy(code, "execute");
+            if (denied)
+                return denied;
+        }
+        else {
+            const denied = checkNonShellDenyPolicy(code, language, "execute");
+            if (denied)
+                return denied;
+        }
+        try {
+            // For JS/TS: wrap in async IIFE with fetch + http/https interceptors to track network bytes
+            let instrumentedCode = code;
+            if (language === "javascript" || language === "typescript") {
+                // Wrap user code in a closure that shadows CJS require with http/https interceptor.
+                // globalThis.require does NOT work because CJS require is module-scoped, not global.
+                // The closure approach (function(__cm_req){ var require=...; })(require) correctly
+                // shadows the CJS require for all code inside, including __cm_main().
+                instrumentedCode = `
 let __cm_net=0;
 // Report network bytes on process exit — works with both promise and callback patterns.
 // process.on('exit') fires after all I/O completes, unlike .finally() which fires
@@ -378,93 +388,97 @@ ${code}
 }
 __cm_main().catch(e=>{console.error(e);process.exitCode=1});${background ? '\nsetInterval(()=>{},2147483647);' : ''}
 })(typeof require!=='undefined'?require:null);`;
-        }
-        const result = await executor.execute({ language, code: instrumentedCode, timeout, background });
-        // Parse sandbox network metrics from stderr
-        const netMatch = result.stderr?.match(/__CM_NET__:(\d+)/);
-        if (netMatch) {
-            sessionStats.bytesSandboxed += parseInt(netMatch[1]);
-            // Clean the metric line from stderr
-            result.stderr = result.stderr.replace(/\n?__CM_NET__:\d+\n?/g, "");
-        }
-        if (result.timedOut) {
-            const partialOutput = result.stdout?.trim();
-            if (result.backgrounded && partialOutput) {
-                // Background mode: process is still running, return partial output as success
+            }
+            const result = await executor.execute({ language, code: instrumentedCode, timeout, background });
+            // Parse sandbox network metrics from stderr
+            const netMatch = result.stderr?.match(/__CM_NET__:(\d+)/);
+            if (netMatch) {
+                sessionStats.bytesSandboxed += parseInt(netMatch[1]);
+                // Clean the metric line from stderr
+                result.stderr = result.stderr.replace(/\n?__CM_NET__:\d+\n?/g, "");
+            }
+            if (result.timedOut) {
+                const partialOutput = result.stdout?.trim();
+                if (result.backgrounded && partialOutput) {
+                    // Background mode: process is still running, return partial output as success
+                    return trackResponse("cm_execute", {
+                        content: [
+                            {
+                                type: "text",
+                                text: `${partialOutput}\n\n_(process backgrounded after ${timeout}ms — still running)_`,
+                            },
+                        ],
+                    });
+                }
+                if (partialOutput) {
+                    // Timeout with partial output — return as success with note
+                    return trackResponse("cm_execute", {
+                        content: [
+                            {
+                                type: "text",
+                                text: `${partialOutput}\n\n_(timed out after ${timeout}ms — partial output shown above)_`,
+                            },
+                        ],
+                    });
+                }
                 return trackResponse("cm_execute", {
                     content: [
                         {
                             type: "text",
-                            text: `${partialOutput}\n\n_(process backgrounded after ${timeout}ms — still running)_`,
+                            text: `Execution timed out after ${timeout}ms\n\nstderr:\n${result.stderr}`,
                         },
                     ],
+                    isError: true,
                 });
             }
-            if (partialOutput) {
-                // Timeout with partial output — return as success with note
-                return trackResponse("cm_execute", {
-                    content: [
-                        {
-                            type: "text",
-                            text: `${partialOutput}\n\n_(timed out after ${timeout}ms — partial output shown above)_`,
-                        },
-                    ],
+            if (result.exitCode !== 0) {
+                const { isError, output } = classifyNonZeroExit({
+                    language, exitCode: result.exitCode, stdout: result.stdout, stderr: result.stderr,
                 });
-            }
-            return trackResponse("cm_execute", {
-                content: [
-                    {
-                        type: "text",
-                        text: `Execution timed out after ${timeout}ms\n\nstderr:\n${result.stderr}`,
-                    },
-                ],
-                isError: true,
-            });
-        }
-        if (result.exitCode !== 0) {
-            const { isError, output } = classifyNonZeroExit({
-                language, exitCode: result.exitCode, stdout: result.stdout, stderr: result.stderr,
-            });
-            if (intent && intent.trim().length > 0 && Buffer.byteLength(output) > INTENT_SEARCH_THRESHOLD) {
-                trackIndexed(Buffer.byteLength(output));
+                if (intent && intent.trim().length > 0 && Buffer.byteLength(output) > INTENT_SEARCH_THRESHOLD) {
+                    trackIndexed(Buffer.byteLength(output));
+                    return trackResponse("cm_execute", {
+                        content: [
+                            { type: "text", text: intentSearch(output, intent, isError ? `execute:${language}:error` : `execute:${language}`) },
+                        ],
+                        isError,
+                    });
+                }
                 return trackResponse("cm_execute", {
                     content: [
-                        { type: "text", text: intentSearch(output, intent, isError ? `execute:${language}:error` : `execute:${language}`) },
+                        { type: "text", text: output },
                     ],
                     isError,
                 });
             }
+            const stdout = result.stdout || "(no output)";
+            // Intent-driven search: if intent provided and output is large enough
+            if (intent && intent.trim().length > 0 && Buffer.byteLength(stdout) > INTENT_SEARCH_THRESHOLD) {
+                trackIndexed(Buffer.byteLength(stdout));
+                return trackResponse("cm_execute", {
+                    content: [
+                        { type: "text", text: intentSearch(stdout, intent, `execute:${language}`) },
+                    ],
+                });
+            }
             return trackResponse("cm_execute", {
                 content: [
-                    { type: "text", text: output },
+                    { type: "text", text: stdout },
                 ],
-                isError,
             });
         }
-        const stdout = result.stdout || "(no output)";
-        // Intent-driven search: if intent provided and output is large enough
-        if (intent && intent.trim().length > 0 && Buffer.byteLength(stdout) > INTENT_SEARCH_THRESHOLD) {
-            trackIndexed(Buffer.byteLength(stdout));
+        catch (err) {
+            const message = err instanceof Error ? err.message : String(err);
             return trackResponse("cm_execute", {
                 content: [
-                    { type: "text", text: intentSearch(stdout, intent, `execute:${language}`) },
+                    { type: "text", text: `Runtime error: ${message}` },
                 ],
+                isError: true,
             });
         }
-        return trackResponse("cm_execute", {
-            content: [
-                { type: "text", text: stdout },
-            ],
-        });
     }
-    catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
-        return trackResponse("cm_execute", {
-            content: [
-                { type: "text", text: `Runtime error: ${message}` },
-            ],
-            isError: true,
-        });
+    finally {
+        trackTiming("cm_execute", Date.now() - _t0);
     }
 });
 // ─────────────────────────────────────────────────────────
@@ -568,82 +582,88 @@ server.registerTool("cm_execute_file", {
             "returns only matching sections via BM25 search instead of truncated output."),
     }),
 }, async ({ path, language, code, timeout, intent }) => {
-    // Security: check file path against Read deny patterns
-    const pathDenied = checkFilePathDenyPolicy(path, "execute_file");
-    if (pathDenied)
-        return pathDenied;
-    // Security: check code parameter against Bash deny patterns
-    if (language === "shell") {
-        const codeDenied = checkDenyPolicy(code, "execute_file");
-        if (codeDenied)
-            return codeDenied;
-    }
-    else {
-        const codeDenied = checkNonShellDenyPolicy(code, language, "execute_file");
-        if (codeDenied)
-            return codeDenied;
-    }
+    const _t0 = Date.now();
     try {
-        const result = await executor.executeFile({
-            path,
-            language,
-            code,
-            timeout,
-        });
-        if (result.timedOut) {
-            return trackResponse("cm_execute_file", {
-                content: [
-                    {
-                        type: "text",
-                        text: `Timed out processing ${path} after ${timeout}ms`,
-                    },
-                ],
-                isError: true,
-            });
+        // Security: check file path against Read deny patterns
+        const pathDenied = checkFilePathDenyPolicy(path, "execute_file");
+        if (pathDenied)
+            return pathDenied;
+        // Security: check code parameter against Bash deny patterns
+        if (language === "shell") {
+            const codeDenied = checkDenyPolicy(code, "execute_file");
+            if (codeDenied)
+                return codeDenied;
         }
-        if (result.exitCode !== 0) {
-            const { isError, output } = classifyNonZeroExit({
-                language, exitCode: result.exitCode, stdout: result.stdout, stderr: result.stderr,
+        else {
+            const codeDenied = checkNonShellDenyPolicy(code, language, "execute_file");
+            if (codeDenied)
+                return codeDenied;
+        }
+        try {
+            const result = await executor.executeFile({
+                path,
+                language,
+                code,
+                timeout,
             });
-            if (intent && intent.trim().length > 0 && Buffer.byteLength(output) > INTENT_SEARCH_THRESHOLD) {
-                trackIndexed(Buffer.byteLength(output));
+            if (result.timedOut) {
                 return trackResponse("cm_execute_file", {
                     content: [
-                        { type: "text", text: intentSearch(output, intent, isError ? `file:${path}:error` : `file:${path}`) },
+                        {
+                            type: "text",
+                            text: `Timed out processing ${path} after ${timeout}ms`,
+                        },
+                    ],
+                    isError: true,
+                });
+            }
+            if (result.exitCode !== 0) {
+                const { isError, output } = classifyNonZeroExit({
+                    language, exitCode: result.exitCode, stdout: result.stdout, stderr: result.stderr,
+                });
+                if (intent && intent.trim().length > 0 && Buffer.byteLength(output) > INTENT_SEARCH_THRESHOLD) {
+                    trackIndexed(Buffer.byteLength(output));
+                    return trackResponse("cm_execute_file", {
+                        content: [
+                            { type: "text", text: intentSearch(output, intent, isError ? `file:${path}:error` : `file:${path}`) },
+                        ],
+                        isError,
+                    });
+                }
+                return trackResponse("cm_execute_file", {
+                    content: [
+                        { type: "text", text: output },
                     ],
                     isError,
                 });
             }
+            const stdout = result.stdout || "(no output)";
+            if (intent && intent.trim().length > 0 && Buffer.byteLength(stdout) > INTENT_SEARCH_THRESHOLD) {
+                trackIndexed(Buffer.byteLength(stdout));
+                return trackResponse("cm_execute_file", {
+                    content: [
+                        { type: "text", text: intentSearch(stdout, intent, `file:${path}`) },
+                    ],
+                });
+            }
             return trackResponse("cm_execute_file", {
                 content: [
-                    { type: "text", text: output },
+                    { type: "text", text: stdout },
                 ],
-                isError,
             });
         }
-        const stdout = result.stdout || "(no output)";
-        if (intent && intent.trim().length > 0 && Buffer.byteLength(stdout) > INTENT_SEARCH_THRESHOLD) {
-            trackIndexed(Buffer.byteLength(stdout));
+        catch (err) {
+            const message = err instanceof Error ? err.message : String(err);
             return trackResponse("cm_execute_file", {
                 content: [
-                    { type: "text", text: intentSearch(stdout, intent, `file:${path}`) },
+                    { type: "text", text: `Runtime error: ${message}` },
                 ],
+                isError: true,
             });
         }
-        return trackResponse("cm_execute_file", {
-            content: [
-                { type: "text", text: stdout },
-            ],
-        });
     }
-    catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
-        return trackResponse("cm_execute_file", {
-            content: [
-                { type: "text", text: `Runtime error: ${message}` },
-            ],
-            isError: true,
-        });
+    finally {
+        trackTiming("cm_execute_file", Date.now() - _t0);
     }
 });
 // ─────────────────────────────────────────────────────────
@@ -1068,146 +1088,152 @@ server.registerTool("cm_batch_execute", {
             .describe("Max execution time in ms (default: 60s)"),
     }),
 }, async ({ commands, queries, timeout }) => {
-    // Security: check each command against deny patterns
-    for (const cmd of commands) {
-        const denied = checkDenyPolicy(cmd.command, "batch_execute");
-        if (denied)
-            return denied;
-    }
+    const _t0 = Date.now();
     try {
-        // Execute each command individually so every command gets its own
-        // smartTruncate budget (~100KB). Previously, all commands were
-        // concatenated into a single script where smartTruncate (60% head +
-        // 40% tail) could silently drop middle commands. (Issue #61)
-        const perCommandOutputs = [];
-        const startTime = Date.now();
-        let timedOut = false;
+        // Security: check each command against deny patterns
         for (const cmd of commands) {
-            const elapsed = Date.now() - startTime;
-            const remaining = timeout - elapsed;
-            if (remaining <= 0) {
-                perCommandOutputs.push(`# ${cmd.label}\n\n(skipped — batch timeout exceeded)\n`);
-                timedOut = true;
-                continue;
-            }
-            const result = await executor.execute({
-                language: "shell",
-                code: `${cmd.command} 2>&1`,
-                timeout: remaining,
-            });
-            const output = result.stdout || "(no output)";
-            perCommandOutputs.push(`# ${cmd.label}\n\n${output}\n`);
-            if (result.timedOut) {
-                timedOut = true;
-                // Mark remaining commands as skipped
-                const idx = commands.indexOf(cmd);
-                for (let i = idx + 1; i < commands.length; i++) {
-                    perCommandOutputs.push(`# ${commands[i].label}\n\n(skipped — batch timeout exceeded)\n`);
-                }
-                break;
-            }
+            const denied = checkDenyPolicy(cmd.command, "batch_execute");
+            if (denied)
+                return denied;
         }
-        const stdout = perCommandOutputs.join("\n");
-        const totalBytes = Buffer.byteLength(stdout);
-        const totalLines = stdout.split("\n").length;
-        if (timedOut && perCommandOutputs.length === 0) {
+        try {
+            // Execute each command individually so every command gets its own
+            // smartTruncate budget (~100KB). Previously, all commands were
+            // concatenated into a single script where smartTruncate (60% head +
+            // 40% tail) could silently drop middle commands. (Issue #61)
+            const perCommandOutputs = [];
+            const startTime = Date.now();
+            let timedOut = false;
+            for (const cmd of commands) {
+                const elapsed = Date.now() - startTime;
+                const remaining = timeout - elapsed;
+                if (remaining <= 0) {
+                    perCommandOutputs.push(`# ${cmd.label}\n\n(skipped — batch timeout exceeded)\n`);
+                    timedOut = true;
+                    continue;
+                }
+                const result = await executor.execute({
+                    language: "shell",
+                    code: `${cmd.command} 2>&1`,
+                    timeout: remaining,
+                });
+                const output = result.stdout || "(no output)";
+                perCommandOutputs.push(`# ${cmd.label}\n\n${output}\n`);
+                if (result.timedOut) {
+                    timedOut = true;
+                    // Mark remaining commands as skipped
+                    const idx = commands.indexOf(cmd);
+                    for (let i = idx + 1; i < commands.length; i++) {
+                        perCommandOutputs.push(`# ${commands[i].label}\n\n(skipped — batch timeout exceeded)\n`);
+                    }
+                    break;
+                }
+            }
+            const stdout = perCommandOutputs.join("\n");
+            const totalBytes = Buffer.byteLength(stdout);
+            const totalLines = stdout.split("\n").length;
+            if (timedOut && perCommandOutputs.length === 0) {
+                return trackResponse("cm_batch_execute", {
+                    content: [
+                        {
+                            type: "text",
+                            text: `Batch timed out after ${timeout}ms. No output captured.`,
+                        },
+                    ],
+                    isError: true,
+                });
+            }
+            // Track indexed bytes (raw data that stays in sandbox)
+            trackIndexed(totalBytes);
+            // Index into knowledge base — markdown heading chunking splits by # labels
+            const store = getStore();
+            const source = `batch:${commands
+                .map((c) => c.label)
+                .join(",")
+                .slice(0, 80)}`;
+            const indexed = store.index({ content: stdout, source });
+            // Build section inventory — direct query by source_id (no FTS5 MATCH needed)
+            const allSections = store.getChunksBySource(indexed.sourceId);
+            const inventory = ["## Indexed Sections", ""];
+            const sectionTitles = [];
+            for (const s of allSections) {
+                const bytes = Buffer.byteLength(s.content);
+                inventory.push(`- ${s.title} (${(bytes / 1024).toFixed(1)}KB)`);
+                sectionTitles.push(s.title);
+            }
+            // Run all search queries — 3 results each, smart snippets
+            // Three-tier fallback: scoped → boosted → global
+            const MAX_OUTPUT = 80 * 1024; // 80KB total output cap
+            const queryResults = [];
+            let outputSize = 0;
+            for (const query of queries) {
+                if (outputSize > MAX_OUTPUT) {
+                    queryResults.push(`## ${query}\n(output cap reached — use search(queries: ["${query}"]) for details)\n`);
+                    continue;
+                }
+                // Tier 1: scoped search with fallback (porter → trigram → fuzzy)
+                let results = store.searchWithFallback(query, 3, source);
+                let crossSource = false;
+                // Tier 2: global fallback (no source filter) — warn about cross-source (Issue #61)
+                if (results.length === 0) {
+                    results = store.searchWithFallback(query, 3);
+                    crossSource = results.length > 0;
+                }
+                queryResults.push(`## ${query}`);
+                if (crossSource) {
+                    queryResults.push(`> **Note:** No results in current batch output. Showing results from previously indexed content.`);
+                }
+                queryResults.push("");
+                if (results.length > 0) {
+                    for (const r of results) {
+                        // Use larger snippet (3KB) for batch_execute to reduce tiny-fragment issue (Issue #61)
+                        const snippet = extractSnippet(r.content, query, 3000, r.highlighted);
+                        const sourceTag = crossSource ? ` _(source: ${r.source})_` : "";
+                        queryResults.push(`### ${r.title}${sourceTag}`);
+                        queryResults.push(snippet);
+                        queryResults.push("");
+                        outputSize += snippet.length + r.title.length;
+                    }
+                }
+                else {
+                    queryResults.push("No matching sections found.");
+                    queryResults.push("");
+                }
+            }
+            // Get searchable terms for edge cases where follow-up is needed
+            const distinctiveTerms = store.getDistinctiveTerms
+                ? store.getDistinctiveTerms(indexed.sourceId)
+                : [];
+            const output = [
+                `Executed ${commands.length} commands (${totalLines} lines, ${(totalBytes / 1024).toFixed(1)}KB). ` +
+                    `Indexed ${indexed.totalChunks} sections. Searched ${queries.length} queries.`,
+                "",
+                ...inventory,
+                "",
+                ...queryResults,
+                distinctiveTerms.length > 0
+                    ? `\nSearchable terms for follow-up: ${distinctiveTerms.join(", ")}`
+                    : "",
+            ].join("\n");
+            return trackResponse("cm_batch_execute", {
+                content: [{ type: "text", text: output }],
+            });
+        }
+        catch (err) {
+            const message = err instanceof Error ? err.message : String(err);
             return trackResponse("cm_batch_execute", {
                 content: [
                     {
                         type: "text",
-                        text: `Batch timed out after ${timeout}ms. No output captured.`,
+                        text: `Batch execution error: ${message}`,
                     },
                 ],
                 isError: true,
             });
         }
-        // Track indexed bytes (raw data that stays in sandbox)
-        trackIndexed(totalBytes);
-        // Index into knowledge base — markdown heading chunking splits by # labels
-        const store = getStore();
-        const source = `batch:${commands
-            .map((c) => c.label)
-            .join(",")
-            .slice(0, 80)}`;
-        const indexed = store.index({ content: stdout, source });
-        // Build section inventory — direct query by source_id (no FTS5 MATCH needed)
-        const allSections = store.getChunksBySource(indexed.sourceId);
-        const inventory = ["## Indexed Sections", ""];
-        const sectionTitles = [];
-        for (const s of allSections) {
-            const bytes = Buffer.byteLength(s.content);
-            inventory.push(`- ${s.title} (${(bytes / 1024).toFixed(1)}KB)`);
-            sectionTitles.push(s.title);
-        }
-        // Run all search queries — 3 results each, smart snippets
-        // Three-tier fallback: scoped → boosted → global
-        const MAX_OUTPUT = 80 * 1024; // 80KB total output cap
-        const queryResults = [];
-        let outputSize = 0;
-        for (const query of queries) {
-            if (outputSize > MAX_OUTPUT) {
-                queryResults.push(`## ${query}\n(output cap reached — use search(queries: ["${query}"]) for details)\n`);
-                continue;
-            }
-            // Tier 1: scoped search with fallback (porter → trigram → fuzzy)
-            let results = store.searchWithFallback(query, 3, source);
-            let crossSource = false;
-            // Tier 2: global fallback (no source filter) — warn about cross-source (Issue #61)
-            if (results.length === 0) {
-                results = store.searchWithFallback(query, 3);
-                crossSource = results.length > 0;
-            }
-            queryResults.push(`## ${query}`);
-            if (crossSource) {
-                queryResults.push(`> **Note:** No results in current batch output. Showing results from previously indexed content.`);
-            }
-            queryResults.push("");
-            if (results.length > 0) {
-                for (const r of results) {
-                    // Use larger snippet (3KB) for batch_execute to reduce tiny-fragment issue (Issue #61)
-                    const snippet = extractSnippet(r.content, query, 3000, r.highlighted);
-                    const sourceTag = crossSource ? ` _(source: ${r.source})_` : "";
-                    queryResults.push(`### ${r.title}${sourceTag}`);
-                    queryResults.push(snippet);
-                    queryResults.push("");
-                    outputSize += snippet.length + r.title.length;
-                }
-            }
-            else {
-                queryResults.push("No matching sections found.");
-                queryResults.push("");
-            }
-        }
-        // Get searchable terms for edge cases where follow-up is needed
-        const distinctiveTerms = store.getDistinctiveTerms
-            ? store.getDistinctiveTerms(indexed.sourceId)
-            : [];
-        const output = [
-            `Executed ${commands.length} commands (${totalLines} lines, ${(totalBytes / 1024).toFixed(1)}KB). ` +
-                `Indexed ${indexed.totalChunks} sections. Searched ${queries.length} queries.`,
-            "",
-            ...inventory,
-            "",
-            ...queryResults,
-            distinctiveTerms.length > 0
-                ? `\nSearchable terms for follow-up: ${distinctiveTerms.join(", ")}`
-                : "",
-        ].join("\n");
-        return trackResponse("cm_batch_execute", {
-            content: [{ type: "text", text: output }],
-        });
     }
-    catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
-        return trackResponse("cm_batch_execute", {
-            content: [
-                {
-                    type: "text",
-                    text: `Batch execution error: ${message}`,
-                },
-            ],
-            isError: true,
-        });
+    finally {
+        trackTiming("cm_batch_execute", Date.now() - _t0);
     }
 });
 // ─────────────────────────────────────────────────────────
@@ -1264,6 +1290,18 @@ server.registerTool("cm_stats", {
         }
         if (keptOut > 0) {
             lines.push("", `Without A8-Cortex, **${kb(totalProcessed)}** of raw output would flood your context window. Instead, **${reductionPct}%** stayed in sandbox.`);
+        }
+    }
+    // Performance profiler
+    const timedTools = Object.entries(sessionStats.timing).filter(([, times]) => times.length > 0);
+    if (timedTools.length > 0) {
+        lines.push("", "### Performance", "", "| Tool | Calls | Avg | Min | Max | Slow (>5s) |", "|------|------:|----:|----:|----:|-----------:|");
+        for (const [tool, times] of timedTools.sort((a, b) => a[0].localeCompare(b[0]))) {
+            const avg = (times.reduce((a, b) => a + b, 0) / times.length / 1000).toFixed(1);
+            const min = (Math.min(...times) / 1000).toFixed(1);
+            const max = (Math.max(...times) / 1000).toFixed(1);
+            const slow = times.filter(t => t > 5000).length;
+            lines.push(`| ${tool} | ${times.length} | ${avg}s | ${min}s | ${max}s | ${slow > 0 ? "**" + slow + "**" : "0"} |`);
         }
     }
     // ── Session Continuity ──

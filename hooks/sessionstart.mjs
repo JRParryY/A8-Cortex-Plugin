@@ -63,6 +63,25 @@ try {
       additionalContext += `\n<active_services>${[...services].join(", ")}</active_services>`;
     }
 
+    // Progressive skill loading — inject conventions for active services
+    if (serviceEvents.length > 0) {
+      const serviceConventions = {
+        "Backend": "Python 3.14, FastAPI, Strawberry GraphQL, SQLAlchemy. MCP Server 49 tools. pytest tests/ -x",
+        "Frontend": "Flutter/Dart 3.9+, Riverpod. Feature-based (lib/features/). a_ params, _m_ private. flutter test",
+        "Nora": "Python 3.13, LangChain/LangGraph. LLM provider factory. Qdrant memory. 8 skills.",
+        "Scheduler": "Python 3.13, FastAPI, aiokafka. Kafka consumers. PostgreSQL + MongoDB.",
+        "Website": "Next.js 16, React 19, Tailwind 4, pnpm. Xtra Proj/a8website/.",
+      };
+      const activeServices = [...services];
+      const hints = activeServices
+        .map(svc => serviceConventions[svc])
+        .filter(Boolean)
+        .map(hint => `  - ${hint}`);
+      if (hints.length > 0) {
+        additionalContext += `\n<service_conventions>\n${hints.join("\n")}\n</service_conventions>`;
+      }
+    }
+
     db.close();
   } else if (source === "resume") {
     // User used --continue — clear cleanup flag so startup doesn't wipe data
@@ -87,6 +106,25 @@ try {
         services.add(svc);
       }
       additionalContext += `\n<active_services>${[...services].join(", ")}</active_services>`;
+    }
+
+    // Progressive skill loading — inject conventions for active services
+    if (serviceEvents.length > 0) {
+      const serviceConventions = {
+        "Backend": "Python 3.14, FastAPI, Strawberry GraphQL, SQLAlchemy. MCP Server 49 tools. pytest tests/ -x",
+        "Frontend": "Flutter/Dart 3.9+, Riverpod. Feature-based (lib/features/). a_ params, _m_ private. flutter test",
+        "Nora": "Python 3.13, LangChain/LangGraph. LLM provider factory. Qdrant memory. 8 skills.",
+        "Scheduler": "Python 3.13, FastAPI, aiokafka. Kafka consumers. PostgreSQL + MongoDB.",
+        "Website": "Next.js 16, React 19, Tailwind 4, pnpm. Xtra Proj/a8website/.",
+      };
+      const activeServices = [...services];
+      const hints = activeServices
+        .map(svc => serviceConventions[svc])
+        .filter(Boolean)
+        .map(hint => `  - ${hint}`);
+      if (hints.length > 0) {
+        additionalContext += `\n<service_conventions>\n${hints.join("\n")}\n</service_conventions>`;
+      }
     }
 
     db.close();
@@ -150,6 +188,53 @@ try {
           db.insertEvent(sessionId, { type: "rule", category: "rule", data: doc.path, priority: 1 });
         }
       } catch { /* file doesn't exist — skip */ }
+    }
+
+    // Progressive skill loading — inject service-specific conventions
+    // based on which service subdirectory the project dir points to
+    const serviceConventions = {
+      "active-8-backend": `<service_context service="Backend">
+  Stack: Python 3.14, FastAPI, Strawberry GraphQL, SQLAlchemy async, Alembic
+  Patterns: MCP Server (49 tools, 12 modules), service layer, async ORM
+  Test: pytest tests/ -x -q
+  Lint: black app/ && isort app/ && flake8 app/ && mypy app/
+</service_context>`,
+      "Active-8-frontend": `<service_context service="Frontend">
+  Stack: Flutter/Dart 3.9+, Riverpod
+  Patterns: Feature-based modular (lib/features/), part files with mixins
+  Naming: a_ params, _m_ private, c_ constants, E enums, I interfaces
+  Theme: context.accentColor, context.surfaceBackground, AppTextStyles.heading()
+  Test: flutter test
+  Conventions: See CODING_CONVENTIONS.md and ARCHITECTURE.md
+</service_context>`,
+      "nora": `<service_context service="Nora">
+  Stack: Python 3.13, FastAPI, LangChain/LangGraph
+  Patterns: LLM provider abstraction (factory), agent orchestrator, 8 skills
+  Memory: Qdrant vector DB, user-scoped semantic search
+  Voice: LiveKit + Deepgram STT + Cartesia TTS
+  Profile: NORA_MODEL_PROFILE env var (openai/anthropic/openrouter/mock)
+</service_context>`,
+      "Scheduler": `<service_context service="Scheduler">
+  Stack: Python 3.13, FastAPI, aiokafka
+  Patterns: Mixin-based orchestrator, Kafka consumer groups
+  Topics: planner.full_cycle, planner.direct_select, planner.assign_times
+  DB: PostgreSQL (structured) + MongoDB (flexible documents)
+  Test: pytest tests/ -v
+</service_context>`,
+      "a8website": `<service_context service="Website">
+  Stack: Next.js 16, React 19, Tailwind 4, pnpm
+  Dir: Xtra Proj/a8website/
+  Test: pnpm vitest run
+  Build: pnpm build
+</service_context>`,
+    };
+
+    // Detect active service from project dir
+    for (const [dir, context] of Object.entries(serviceConventions)) {
+      if (projectDir.includes(dir)) {
+        additionalContext += "\n" + context;
+        break;
+      }
     }
 
     db.close();
