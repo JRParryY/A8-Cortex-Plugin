@@ -297,8 +297,8 @@ server.registerTool("cm_execute", {
         timeout: z
             .number()
             .optional()
-            .default(30000)
-            .describe("Max execution time in ms"),
+            .default(120000)
+            .describe("Max execution time in ms (default: 2 minutes)"),
         background: z
             .boolean()
             .optional()
@@ -559,8 +559,8 @@ server.registerTool("cm_execute_file", {
         timeout: z
             .number()
             .optional()
-            .default(30000)
-            .describe("Max execution time in ms"),
+            .default(120000)
+            .describe("Max execution time in ms (default: 2 minutes)"),
         intent: z
             .string()
             .optional()
@@ -1246,7 +1246,7 @@ server.registerTool("cm_stats", {
         lines.push(`No A8-Cortex tool calls yet. Use \`batch_execute\`, \`execute\`, or \`fetch_and_index\` to keep raw output out of your context window.`);
     }
     else {
-        lines.push(`| Metric | Value |`, `|--------|------:|`, `| Total data processed | **${kb(totalProcessed)}** |`, `| Kept in sandbox (never entered context) | **${kb(keptOut)}** |`, `| Entered context | ${kb(totalBytesReturned)} |`, `| Estimated tokens saved | ~${Math.round(keptOut / 4).toLocaleString()} |`, `| **Context savings** | **${savingsRatio.toFixed(1)}x (${reductionPct}% reduction)** |`);
+        lines.push(`| Metric | Value |`, `|--------|------:|`, `| Total data processed | **${kb(totalProcessed)}** |`, `| Kept in sandbox (never entered context) | **${kb(keptOut)}** |`, `| Entered context | ${kb(totalBytesReturned)} |`, `| Estimated tokens saved | ~${Math.round(keptOut / 4).toLocaleString()} |`, `| **Context savings** | **${savingsRatio.toFixed(1)}x (${reductionPct}% reduction)** |`, `| Estimated cost saved | ~$${(keptOut / 4 / 1_000_000 * 3).toFixed(2)} |`);
         // Per-tool breakdown
         const toolNames = new Set([
             ...Object.keys(sessionStats.calls),
@@ -1476,6 +1476,59 @@ server.registerTool("cm_index_project", {
         (failed.length > 0 ? `\nFailed: ${failed.join(", ")}` : "") +
         `\n\nUse cm_search(queries: [...], source: "arch:Frontend") to query.`;
     return trackResponse("cm_index_project", {
+        content: [{ type: "text", text: summary }],
+    });
+});
+// ── cm_watch_logs: Watch process logs and surface errors ──
+server.registerTool("cm_watch_logs", {
+    title: "Watch Logs",
+    description: "Run a command and capture its output, filtering for errors and warnings. " +
+        "Useful for monitoring running apps (Flutter, uvicorn, etc.) without flooding context. " +
+        "Returns only lines matching error/warning patterns.",
+    inputSchema: z.object({
+        command: z
+            .string()
+            .describe("Shell command to run and monitor (e.g., 'flutter logs', 'tail -f app.log')"),
+        timeout: z
+            .number()
+            .optional()
+            .default(30000)
+            .describe("How long to watch in ms (default: 30s)"),
+        filter: z
+            .string()
+            .optional()
+            .default("error|warning|exception|traceback|failed|fatal|panic|crash")
+            .describe("Regex pattern to filter interesting lines (case-insensitive)"),
+    }),
+}, async ({ command, timeout, filter }) => {
+    // Security check
+    const denied = checkDenyPolicy(command, "cm_watch_logs");
+    if (denied)
+        return denied;
+    const result = await executor.execute({
+        language: "shell",
+        code: command,
+        timeout: timeout,
+    });
+    const output = result.stdout + (result.stderr ? "\n" + result.stderr : "");
+    const lines = output.split("\n");
+    const filterRegex = new RegExp(filter, "i");
+    const matched = lines.filter(line => filterRegex.test(line));
+    const total = lines.length;
+    let summary;
+    if (matched.length === 0) {
+        summary = `Watched ${total} lines over ${(timeout / 1000).toFixed(0)}s. No errors or warnings found.\n\nLast 5 lines:\n${lines.slice(-5).join("\n")}`;
+    }
+    else {
+        summary = `Found ${matched.length} matching lines out of ${total} total:\n\n${matched.join("\n")}`;
+    }
+    // Index full output for search
+    if (total > 50) {
+        const store = getStore();
+        store.index({ content: output, source: "logs:" + command.split(" ")[0] });
+        summary += `\n\nFull output indexed as "logs:${command.split(" ")[0]}" -- use cm_search to query.`;
+    }
+    return trackResponse("cm_watch_logs", {
         content: [{ type: "text", text: summary }],
     });
 });

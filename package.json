@@ -43,7 +43,8 @@
     "LICENSE"
   ],
   "scripts": {
-    "build": "tsc && chmod +x build/cli.js",
+    "build": "tsc && chmod +x build/cli.js && npm run bundle",
+    "deploy": "npm run build && npm run bundle && node scripts/deploy.mjs",
     "bundle": "esbuild src/server.ts --bundle --platform=node --target=node18 --format=esm --outfile=server.bundle.mjs --external:better-sqlite3 --external:turndown --external:turndown-plugin-gfm --external:@mixmark-io/domino --minify && esbuild src/cli.ts --bundle --platform=node --target=node18 --format=esm --outfile=cli.bundle.mjs --external:better-sqlite3 --minify && esbuild src/session/extract.ts --bundle --platform=node --target=node18 --format=esm --outfile=hooks/session-extract.bundle.mjs --minify && esbuild src/session/snapshot.ts --bundle --platform=node --target=node18 --format=esm --outfile=hooks/session-snapshot.bundle.mjs --minify && esbuild src/session/db.ts --bundle --platform=node --target=node18 --format=esm --outfile=hooks/session-db.bundle.mjs --external:better-sqlite3 --minify",
     "prepublishOnly": "npm run build",
     "dev": "npx tsx src/server.ts",

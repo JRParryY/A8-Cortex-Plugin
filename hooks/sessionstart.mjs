@@ -52,6 +52,17 @@ try {
       additionalContext += buildSessionDirective("compact", eventMeta);
     }
 
+    // Add active services to routing block
+    const serviceEvents = events.filter(e => e.category === "service");
+    if (serviceEvents.length > 0) {
+      const services = new Set();
+      for (const ev of serviceEvents) {
+        const svc = ev.data.split(":")[0].trim();
+        services.add(svc);
+      }
+      additionalContext += `\n<active_services>${[...services].join(", ")}</active_services>`;
+    }
+
     db.close();
   } else if (source === "resume") {
     // User used --continue — clear cleanup flag so startup doesn't wipe data
@@ -65,6 +76,17 @@ try {
     if (events.length > 0) {
       const eventMeta = writeSessionEventsFile(events, getSessionEventsPath());
       additionalContext += buildSessionDirective("resume", eventMeta);
+    }
+
+    // Add active services to routing block
+    const serviceEvents = events.filter(e => e.category === "service");
+    if (serviceEvents.length > 0) {
+      const services = new Set();
+      for (const ev of serviceEvents) {
+        const svc = ev.data.split(":")[0].trim();
+        services.add(svc);
+      }
+      additionalContext += `\n<active_services>${[...services].join(", ")}</active_services>`;
     }
 
     db.close();
