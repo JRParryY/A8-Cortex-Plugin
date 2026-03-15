@@ -1,0 +1,29 @@
+{
+  "name": "a8-cortex",
+  "owner": {
+    "name": "Roy Parry"
+  },
+  "metadata": {
+    "description": "A8-Cortex plugins for Active-8 monorepo",
+    "version": "0.1.0"
+  },
+  "plugins": [
+    {
+      "name": "a8-cortex",
+      "source": "./",
+      "description": "A8-Cortex MCP plugin for Active-8. Sandboxed code execution, FTS5 knowledge base, session continuity for cross-service development.",
+      "version": "0.1.0",
+      "author": {
+        "name": "Roy Parry"
+      },
+      "category": "development",
+      "keywords": [
+        "mcp",
+        "context-window",
+        "sandbox",
+        "code-execution",
+        "fts5"
+      ]
+    }
+  ]
+}

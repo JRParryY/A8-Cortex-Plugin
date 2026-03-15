@@ -1,0 +1,379 @@
+#!/usr/bin/env node
+/**
+ * A8-Cortex CLI
+ *
+ * Usage:
+ *   a8-cortex                              → Start MCP server (stdio)
+ *   a8-cortex doctor                       → Diagnose runtime issues, hooks, FTS5, version
+ *   a8-cortex upgrade                      → Fix hooks, permissions, and settings
+ *   a8-cortex hook <platform> <event>      → Dispatch a hook script (used by platform hook configs)
+ *
+ * Platform auto-detection: CLI detects which platform is running
+ * (Claude Code, Gemini CLI, OpenCode, etc.) and uses the appropriate adapter.
+ */
+import * as p from "@clack/prompts";
+import color from "picocolors";
+import { execSync } from "node:child_process";
+import { readFileSync, accessSync, existsSync, closeSync, openSync, constants } from "node:fs";
+import { request as httpsRequest } from "node:https";
+import { resolve, dirname, join } from "node:path";
+import { devNull } from "node:os";
+import { fileURLToPath, pathToFileURL } from "node:url";
+import { detectRuntimes, getRuntimeSummary, hasBunRuntime, getAvailableLanguages, } from "./runtime.js";
+// ── Adapter imports ──────────────────────────────────────
+import { detectPlatform, getAdapter } from "./adapters/detect.js";
+/* -------------------------------------------------------
+ * Hook dispatcher — `a8-cortex hook <platform> <event>`
+ * ------------------------------------------------------- */
+const HOOK_MAP = {
+    "claude-code": {
+        pretooluse: "hooks/pretooluse.mjs",
+        posttooluse: "hooks/posttooluse.mjs",
+        precompact: "hooks/precompact.mjs",
+        sessionstart: "hooks/sessionstart.mjs",
+        userpromptsubmit: "hooks/userpromptsubmit.mjs",
+    },
+    "gemini-cli": {
+        beforetool: "hooks/gemini-cli/beforetool.mjs",
+        aftertool: "hooks/gemini-cli/aftertool.mjs",
+        precompress: "hooks/gemini-cli/precompress.mjs",
+        sessionstart: "hooks/gemini-cli/sessionstart.mjs",
+    },
+    "vscode-copilot": {
+        pretooluse: "hooks/vscode-copilot/pretooluse.mjs",
+        posttooluse: "hooks/vscode-copilot/posttooluse.mjs",
+        precompact: "hooks/vscode-copilot/precompact.mjs",
+        sessionstart: "hooks/vscode-copilot/sessionstart.mjs",
+    },
+    "cursor": {
+        pretooluse: "hooks/cursor/pretooluse.mjs",
+        posttooluse: "hooks/cursor/posttooluse.mjs",
+        sessionstart: "hooks/cursor/sessionstart.mjs",
+    },
+};
+async function hookDispatch(platform, event) {
+    // Suppress stderr at OS fd level — native C++ modules (better-sqlite3) write
+    // directly to fd 2 during initialization, bypassing Node.js process.stderr.
+    // Platforms like Claude Code interpret ANY stderr output as hook failure.
+    // Cross-platform: os.devNull → /dev/null (Unix) or \\.\NUL (Windows). See: #68
+    try {
+        closeSync(2);
+        openSync(devNull, "w"); // Acquires fd 2 (lowest available)
+    }
+    catch {
+        process.stderr.write = (() => true);
+    }
+    const scriptPath = HOOK_MAP[platform]?.[event];
+    if (!scriptPath) {
+        process.exit(1);
+    }
+    const pluginRoot = getPluginRoot();
+    await import(pathToFileURL(join(pluginRoot, scriptPath)).href);
+}
+/* -------------------------------------------------------
+ * Entry point
+ * ------------------------------------------------------- */
+const args = process.argv.slice(2);
+if (args[0] === "doctor") {
+    doctor().then((code) => process.exit(code));
+}
+else if (args[0] === "upgrade") {
+    upgrade();
+}
+else if (args[0] === "hook") {
+    hookDispatch(args[1], args[2]);
+}
+else {
+    // Default: start MCP server
+    import("./server.js");
+}
+/* -------------------------------------------------------
+ * Shared helpers
+ * ------------------------------------------------------- */
+/** Normalize Windows backslash paths to forward slashes for Bash (MSYS2) compatibility. */
+export function toUnixPath(p) {
+    return p.replace(/\\/g, "/");
+}
+function getPluginRoot() {
+    const __filename = fileURLToPath(import.meta.url);
+    const __dirname = dirname(__filename);
+    // build/cli.js → go up one level; cli.bundle.mjs at project root → stay here
+    if (__dirname.endsWith("/build") || __dirname.endsWith("\\build")) {
+        return resolve(__dirname, "..");
+    }
+    return __dirname;
+}
+function getLocalVersion() {
+    try {
+        const pkg = JSON.parse(readFileSync(resolve(getPluginRoot(), "package.json"), "utf-8"));
+        return pkg.version ?? "unknown";
+    }
+    catch {
+        return "unknown";
+    }
+}
+async function fetchLatestVersion() {
+    // Use node:https instead of global fetch to avoid a Windows libuv assertion
+    // (UV_HANDLE_CLOSING) caused by undici's connection-pool background threads
+    // racing with process.exit() teardown on Node.js v24+.
+    return new Promise((resolve) => {
+        const req = httpsRequest("https://registry.npmjs.org/context-mode/latest", { headers: { Connection: "close" } }, (res) => {
+            let raw = "";
+            res.on("data", (chunk) => { raw += chunk; });
+            res.on("end", () => {
+                try {
+                    const data = JSON.parse(raw);
+                    resolve(data.version ?? "unknown");
+                }
+                catch {
+                    resolve("unknown");
+                }
+            });
+        });
+        req.on("error", () => resolve("unknown"));
+        req.setTimeout(5000, () => { req.destroy(); resolve("unknown"); });
+        req.end();
+    });
+}
+/* -------------------------------------------------------
+ * Doctor — adapter-aware diagnostics
+ * ------------------------------------------------------- */
+async function doctor() {
+    if (process.stdout.isTTY)
+        console.clear();
+    // Detect platform
+    const detection = detectPlatform();
+    const adapter = await getAdapter(detection.platform);
+    p.intro(color.bgMagenta(color.white(" A8-Cortex doctor")));
+    p.log.info(`Platform: ${color.cyan(adapter.name)}` +
+        color.dim(` (${detection.confidence} confidence — ${detection.reason})`));
+    let criticalFails = 0;
+    const s = p.spinner();
+    s.start("Running diagnostics");
+    let runtimes;
+    let available;
+    try {
+        runtimes = detectRuntimes();
+        available = getAvailableLanguages(runtimes);
+    }
+    catch {
+        s.stop("Diagnostics partial");
+        p.log.warn(color.yellow("Could not detect runtimes") + color.dim(" — module may be missing, restart session after upgrade"));
+        p.outro(color.yellow("Doctor could not fully run — try again after restarting"));
+        return 1;
+    }
+    s.stop("Diagnostics complete");
+    // Runtime check
+    p.note(getRuntimeSummary(runtimes), "Runtimes");
+    // Speed tier
+    if (hasBunRuntime()) {
+        p.log.success(color.green("Performance: FAST") +
+            " — Bun detected for JS/TS execution");
+    }
+    else {
+        p.log.warn(color.yellow("Performance: NORMAL") +
+            " — Using Node.js (install Bun for 3-5x speed boost)");
+    }
+    // Language coverage
+    const total = 11;
+    const pct = ((available.length / total) * 100).toFixed(0);
+    if (available.length < 2) {
+        criticalFails++;
+        p.log.error(color.red(`Language coverage: ${available.length}/${total} (${pct}%)`) +
+            " — too few runtimes detected" +
+            color.dim(` — ${available.join(", ") || "none"}`));
+    }
+    else {
+        p.log.info(`Language coverage: ${available.length}/${total} (${pct}%)` +
+            color.dim(` — ${available.join(", ")}`));
+    }
+    // Server test
+    p.log.step("Testing server initialization...");
+    try {
+        const { PolyglotExecutor } = await import("./executor.js");
+        const executor = new PolyglotExecutor({ runtimes });
+        const result = await executor.execute({
+            language: "javascript",
+            code: 'console.log("ok");',
+            timeout: 5000,
+        });
+        if (result.exitCode === 0 && result.stdout.trim() === "ok") {
+            p.log.success(color.green("Server test: PASS"));
+        }
+        else {
+            criticalFails++;
+            p.log.error(color.red("Server test: FAIL") + ` — exit ${result.exitCode}`);
+        }
+    }
+    catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        if (message.includes("Cannot find module") || message.includes("MODULE_NOT_FOUND")) {
+            p.log.warn(color.yellow("Server test: SKIP") + color.dim(" — module not available (restart session after upgrade)"));
+        }
+        else {
+            criticalFails++;
+            p.log.error(color.red("Server test: FAIL") + ` — ${message}`);
+        }
+    }
+    // Hooks — adapter-aware validation
+    p.log.step(`Checking ${adapter.name} hooks configuration...`);
+    const pluginRoot = getPluginRoot();
+    const hookResults = adapter.validateHooks(pluginRoot);
+    for (const result of hookResults) {
+        if (result.status === "pass") {
+            p.log.success(color.green(`${result.check}: PASS`) + ` — ${result.message}`);
+        }
+        else {
+            p.log.error(color.red(`${result.check}: FAIL`) +
+                ` — ${result.message}` +
+                (result.fix ? color.dim(`\n  Run: ${result.fix}`) : ""));
+        }
+    }
+    // Hook script exists
+    p.log.step("Checking hook script...");
+    const hookScriptPath = resolve(pluginRoot, "hooks", "pretooluse.mjs");
+    try {
+        accessSync(hookScriptPath, constants.R_OK);
+        p.log.success(color.green("Hook script exists: PASS") + color.dim(` — ${hookScriptPath}`));
+    }
+    catch {
+        p.log.error(color.red("Hook script exists: FAIL") +
+            color.dim(` — not found at ${hookScriptPath}`));
+    }
+    // Plugin registration — adapter-aware
+    p.log.step(`Checking ${adapter.name} plugin registration...`);
+    const pluginCheck = adapter.checkPluginRegistration();
+    if (pluginCheck.status === "pass") {
+        p.log.success(color.green("Plugin enabled: PASS") + color.dim(` — ${pluginCheck.message}`));
+    }
+    else {
+        p.log.warn(color.yellow("Plugin enabled: WARN") +
+            ` — ${pluginCheck.message}`);
+    }
+    // FTS5 / better-sqlite3
+    p.log.step("Checking FTS5 / better-sqlite3...");
+    try {
+        const Database = (await import("better-sqlite3")).default;
+        const db = new Database(":memory:");
+        db.exec("CREATE VIRTUAL TABLE fts_test USING fts5(content)");
+        db.exec("INSERT INTO fts_test(content) VALUES ('hello world')");
+        const row = db.prepare("SELECT * FROM fts_test WHERE fts_test MATCH 'hello'").get();
+        db.close();
+        if (row && row.content === "hello world") {
+            p.log.success(color.green("FTS5 / better-sqlite3: PASS") + " — native module works");
+        }
+        else {
+            criticalFails++;
+            p.log.error(color.red("FTS5 / better-sqlite3: FAIL") + " — query returned unexpected result");
+        }
+    }
+    catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        if (message.includes("Cannot find module") || message.includes("MODULE_NOT_FOUND")) {
+            p.log.warn(color.yellow("FTS5 / better-sqlite3: SKIP") + color.dim(" — module not available (restart session after upgrade)"));
+        }
+        else {
+            criticalFails++;
+            p.log.error(color.red("FTS5 / better-sqlite3: FAIL") +
+                ` — ${message}` +
+                color.dim("\n  Try: npm rebuild better-sqlite3"));
+        }
+    }
+    // Version check — adapter-aware
+    p.log.step("Checking versions...");
+    const localVersion = getLocalVersion();
+    const latestVersion = await fetchLatestVersion();
+    const installedVersion = adapter.getInstalledVersion();
+    if (latestVersion === "unknown") {
+        p.log.warn(color.yellow("npm (MCP): WARN") +
+            ` — local v${localVersion}, could not reach npm registry`);
+    }
+    else if (localVersion === latestVersion) {
+        p.log.success(color.green("npm (MCP): PASS") +
+            ` — v${localVersion}`);
+    }
+    else {
+        p.log.warn(color.yellow("npm (MCP): WARN") +
+            ` — local v${localVersion}, latest v${latestVersion}` +
+            color.dim("\n  Run: /a8-cortex:cm-upgrade"));
+    }
+    if (installedVersion === "not installed") {
+        p.log.info(color.dim(`${adapter.name}: not installed`) +
+            " — using standalone MCP mode");
+    }
+    else if (latestVersion !== "unknown" && installedVersion === latestVersion) {
+        p.log.success(color.green(`${adapter.name}: PASS`) +
+            ` — v${installedVersion}`);
+    }
+    else if (latestVersion !== "unknown") {
+        p.log.warn(color.yellow(`${adapter.name}: WARN`) +
+            ` — v${installedVersion}, latest v${latestVersion}` +
+            color.dim("\n  Run: /a8-cortex:cm-upgrade"));
+    }
+    else {
+        p.log.info(`${adapter.name}: v${installedVersion}` +
+            color.dim(" — could not verify against npm registry"));
+    }
+    // Summary
+    if (criticalFails > 0) {
+        p.outro(color.red(`Diagnostics failed — ${criticalFails} critical issue(s) found`));
+        return 1;
+    }
+    p.outro(available.length >= 4
+        ? color.green("Diagnostics complete!")
+        : color.yellow("Some checks need attention — see above for details"));
+    return 0;
+}
+/* -------------------------------------------------------
+ * Upgrade — adapter-aware hook configuration
+ * ------------------------------------------------------- */
+async function upgrade() {
+    if (process.stdout.isTTY)
+        console.clear();
+    const detection = detectPlatform();
+    const adapter = await getAdapter(detection.platform);
+    p.intro(color.bgCyan(color.black(" A8-Cortex upgrade")));
+    p.log.info(`Platform: ${color.cyan(adapter.name)}` +
+        color.dim(` (${detection.confidence} confidence)`));
+    const pluginRoot = getPluginRoot();
+    const changes = [];
+    const s = p.spinner();
+    // Step 1: Build locally
+    p.log.step("Building locally...");
+    s.start("Running npm run build");
+    try {
+        execSync("npm run build", {
+            cwd: pluginRoot,
+            stdio: "pipe",
+            timeout: 30000,
+        });
+        s.stop(color.green("Build complete"));
+        changes.push("Built from local source");
+    }
+    catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        s.stop(color.red("Build failed"));
+        p.log.error(color.red("Build failed") + ` — ${message}`);
+    }
+    // Step 2: Report
+    if (changes.length > 0) {
+        p.note(changes.map((c) => color.green("  + ") + c).join("\n"), "Changes Applied");
+    }
+    // Step 3: Run doctor
+    p.log.step("Running doctor to verify...");
+    console.log();
+    try {
+        const cliBundlePath = resolve(pluginRoot, "cli.bundle.mjs");
+        const cliBuildPath = resolve(pluginRoot, "build", "cli.js");
+        const cliPath = existsSync(cliBundlePath) ? cliBundlePath : cliBuildPath;
+        execSync(`node "${cliPath}" doctor`, {
+            stdio: "inherit",
+            timeout: 30000,
+            cwd: pluginRoot,
+        });
+    }
+    catch {
+        p.log.warn(color.yellow("Doctor had warnings") +
+            color.dim(` — restart your ${adapter.name} session to pick up the new version`));
+    }
+}

@@ -1,0 +1,23 @@
+{
+  "name": "a8-cortex",
+  "version": "0.1.0",
+  "description": "A8-Cortex MCP server for Active-8. Sandboxed code execution, FTS5 knowledge base, session continuity.",
+  "license": "Elastic-2.0",
+  "keywords": [
+    "mcp",
+    "context-window",
+    "sandbox",
+    "code-execution",
+    "fts5",
+    "bm25",
+    "playwright",
+    "context7"
+  ],
+  "mcpServers": {
+    "a8-cortex": {
+      "command": "node",
+      "args": ["${CLAUDE_PLUGIN_ROOT}/start.mjs"]
+    }
+  },
+  "skills": "./skills/"
+}
