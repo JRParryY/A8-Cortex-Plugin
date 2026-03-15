@@ -53,6 +53,7 @@ export interface IndexResult {
     label: string;
     totalChunks: number;
     codeChunks: number;
+    mergedChunks?: number;
 }
 /**
  * A single search result returned from FTS5 BM25-ranked lookup.

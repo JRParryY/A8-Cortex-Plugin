@@ -11,6 +11,8 @@ import { loadDatabase, applyWALPragmas } from "./db-base.js";
 import { readFileSync, readdirSync, unlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { chunkCode, detectLanguage } from "./chunker-code.js";
+import { cosineSimilarity } from "./embeddings.js";
 // ─────────────────────────────────────────────────────────
 // Constants
 // ─────────────────────────────────────────────────────────
@@ -196,6 +198,12 @@ export class ContentStore {
       CREATE TABLE IF NOT EXISTS vocabulary (
         word TEXT PRIMARY KEY
       );
+
+      CREATE TABLE IF NOT EXISTS embeddings (
+        chunk_rowid INTEGER PRIMARY KEY,
+        source_id INTEGER NOT NULL,
+        embedding BLOB NOT NULL
+      );
     `);
     }
     #prepareStatements() {
@@ -296,6 +304,29 @@ export class ContentStore {
         const chunks = this.#chunkMarkdown(text);
         return this.#insertChunks(chunks, label, text);
     }
+    // ── Index Code (tree-sitter) ──
+    /**
+     * Index a source code file using tree-sitter for semantic chunking.
+     * Falls back to standard markdown chunking if parsing fails.
+     */
+    async indexCode(options) {
+        const { path: filePath, source: label } = options;
+        const content = readFileSync(filePath, "utf-8");
+        const language = options.language ?? detectLanguage(filePath);
+        if (!language) {
+            // Not a recognized code file, fall back to standard index
+            return this.index({ path: filePath, source: label });
+        }
+        try {
+            const chunks = await chunkCode(content, language);
+            const sourceLabel = label ?? `code:${filePath.split("/").pop()}`;
+            return this.#insertChunks(chunks, sourceLabel, content);
+        }
+        catch {
+            // Tree-sitter failed, fall back to standard indexing
+            return this.index({ path: filePath, source: label });
+        }
+    }
     // ── Index Plain Text ──
     /**
      * Index plain-text output (logs, build output, test results) by splitting
@@ -337,12 +368,94 @@ export class ContentStore {
     }
     // ── Shared DB Insertion ──
     /**
+     * Compute trigram Jaccard similarity between two strings.
+     * Returns 0.0 (no overlap) to 1.0 (identical).
+     */
+    #trigramSimilarity(a, b) {
+        const trigrams = (s) => {
+            const t = new Set();
+            const lower = s.toLowerCase();
+            for (let i = 0; i <= lower.length - 3; i++) {
+                t.add(lower.slice(i, i + 3));
+            }
+            return t;
+        };
+        const ta = trigrams(a);
+        const tb = trigrams(b);
+        if (ta.size === 0 || tb.size === 0)
+            return 0;
+        let intersection = 0;
+        for (const t of ta) {
+            if (tb.has(t))
+                intersection++;
+        }
+        return intersection / (ta.size + tb.size - intersection);
+    }
+    /**
+     * Find an existing chunk that overlaps significantly with the new chunk.
+     * Returns the rowid and content if found, null otherwise.
+     * Only searches chunks from OTHER sources (not the same label).
+     */
+    #findConsolidationTarget(chunk, label) {
+        try {
+            // Extract key terms from title for BM25 search
+            const terms = chunk.title.split(/[\s:]+/).filter(t => t.length > 2).join(" ");
+            if (!terms)
+                return null;
+            const sanitized = terms.replace(/['"(){}[\]^~*?:!@#$%&]/g, "").trim();
+            if (!sanitized)
+                return null;
+            const rows = this.#db.prepare(`
+        SELECT chunks.rowid, chunks.content, chunks.source_id
+        FROM chunks
+        JOIN sources ON sources.id = chunks.source_id
+        WHERE chunks MATCH ? AND sources.label != ?
+        ORDER BY bm25(chunks, 2.0, 1.0)
+        LIMIT 5
+      `).all(sanitized, label);
+            for (const row of rows) {
+                const similarity = this.#trigramSimilarity(chunk.content, row.content);
+                if (similarity > 0.7) {
+                    return { rowid: row.rowid, content: row.content, sourceId: row.source_id };
+                }
+            }
+        }
+        catch {
+            // BM25 match may fail on certain query patterns, skip consolidation
+        }
+        return null;
+    }
+    /**
      * Shared DB insertion logic for all index methods. Inserts chunks
      * into both FTS5 tables within a transaction and extracts vocabulary.
      * Uses cached prepared statements from #prepareStatements().
+     *
+     * When consolidate is true, checks for existing related chunks from
+     * other sources and merges overlapping content instead of duplicating.
      */
-    #insertChunks(chunks, label, text) {
+    #insertChunks(chunks, label, text, consolidate = false) {
         const codeChunks = chunks.filter((c) => c.hasCode).length;
+        let mergedChunks = 0;
+        // Consolidation: check for mergeable chunks before the transaction
+        const mergeTargets = new Map();
+        const chunksToInsert = [];
+        if (consolidate && chunks.length > 0) {
+            for (const chunk of chunks) {
+                const target = this.#findConsolidationTarget(chunk, label);
+                if (target) {
+                    // Append only truly new content
+                    const combined = target.content + "\n\n" + chunk.content;
+                    mergeTargets.set(target.rowid, { rowid: target.rowid, newContent: combined, sourceId: target.sourceId });
+                    mergedChunks++;
+                }
+                else {
+                    chunksToInsert.push(chunk);
+                }
+            }
+        }
+        else {
+            chunksToInsert.push(...chunks);
+        }
         // Atomic dedup + insert: delete previous source with same label,
         // then insert new content — all within a single transaction.
         // Prevents stale results in iterative workflows. (See: GitHub issue #67)
@@ -350,13 +463,18 @@ export class ContentStore {
             this.#stmtDeleteChunksByLabel.run(label);
             this.#stmtDeleteChunksTrigramByLabel.run(label);
             this.#stmtDeleteSourcesByLabel.run(label);
-            if (chunks.length === 0) {
+            // Apply merges to existing chunks from other sources
+            for (const [, merge] of mergeTargets) {
+                this.#db.prepare("UPDATE chunks SET content = ? WHERE rowid = ?").run(merge.newContent, merge.rowid);
+                this.#db.prepare("UPDATE chunks_trigram SET content = ? WHERE rowid = ?").run(merge.newContent, merge.rowid);
+            }
+            if (chunksToInsert.length === 0 && mergedChunks === 0) {
                 const info = this.#stmtInsertSourceEmpty.run(label);
                 return Number(info.lastInsertRowid);
             }
-            const info = this.#stmtInsertSource.run(label, chunks.length, codeChunks);
+            const info = this.#stmtInsertSource.run(label, chunksToInsert.length + mergedChunks, codeChunks);
             const sourceId = Number(info.lastInsertRowid);
-            for (const chunk of chunks) {
+            for (const chunk of chunksToInsert) {
                 const ct = chunk.hasCode ? "code" : "prose";
                 this.#stmtInsertChunk.run(chunk.title, chunk.content, sourceId, ct);
                 this.#stmtInsertChunkTrigram.run(chunk.title, chunk.content, sourceId, ct);
@@ -369,8 +487,9 @@ export class ContentStore {
         return {
             sourceId,
             label,
-            totalChunks: chunks.length,
+            totalChunks: chunksToInsert.length + mergedChunks,
             codeChunks,
+            mergedChunks: mergedChunks > 0 ? mergedChunks : undefined,
         };
     }
     // ── Search ──
@@ -489,6 +608,125 @@ export class ContentStore {
             }
         }
         return [];
+    }
+    // ── Embedding / Vector Search ──
+    /**
+     * Store embeddings for chunks belonging to a source.
+     * Called after indexing when an EmbeddingClient is available.
+     */
+    async storeEmbeddings(sourceId, embeddingClient) {
+        // Get all chunks for this source
+        const chunks = this.#stmtChunkContent.all(sourceId);
+        if (chunks.length === 0)
+            return 0;
+        // Get chunk rowids
+        const rowids = this.#db.prepare("SELECT rowid FROM chunks WHERE source_id = ? ORDER BY rowid").all(sourceId);
+        // Embed all chunks
+        const texts = chunks.map(c => c.content);
+        const embeddings = await embeddingClient.embed(texts);
+        // Store in DB
+        const insert = this.#db.prepare("INSERT OR REPLACE INTO embeddings (chunk_rowid, source_id, embedding) VALUES (?, ?, ?)");
+        const tx = this.#db.transaction(() => {
+            for (let i = 0; i < rowids.length; i++) {
+                const buf = Buffer.from(embeddings[i].buffer);
+                insert.run(rowids[i].rowid, sourceId, buf);
+            }
+        });
+        tx();
+        return embeddings.length;
+    }
+    /**
+     * Vector search: find chunks most similar to a query embedding.
+     * Brute-force cosine similarity (fast enough for <10K chunks).
+     */
+    searchVector(queryEmbedding, limit = 3, source) {
+        let rows;
+        if (source) {
+            rows = this.#db.prepare(`
+        SELECT e.chunk_rowid, e.source_id, e.embedding
+        FROM embeddings e
+        JOIN sources s ON s.id = e.source_id
+        WHERE s.label LIKE ?
+      `).all(`%${source}%`);
+        }
+        else {
+            rows = this.#db.prepare("SELECT chunk_rowid, source_id, embedding FROM embeddings").all();
+        }
+        if (rows.length === 0)
+            return [];
+        // Score each embedding by cosine similarity
+        const scored = rows.map(row => {
+            const vec = new Float32Array(row.embedding.buffer, row.embedding.byteOffset, row.embedding.byteLength / 4);
+            return { rowid: row.chunk_rowid, score: cosineSimilarity(queryEmbedding, vec) };
+        });
+        // Sort by similarity descending, take top-k
+        scored.sort((a, b) => b.score - a.score);
+        const topK = scored.slice(0, limit);
+        // Fetch chunk content for the top results
+        const results = [];
+        for (const { rowid, score } of topK) {
+            const chunk = this.#db.prepare(`
+        SELECT c.title, c.content, c.content_type, s.label
+        FROM chunks c
+        JOIN sources s ON s.id = c.source_id
+        WHERE c.rowid = ?
+      `).get(rowid);
+            if (chunk) {
+                results.push({
+                    title: chunk.title,
+                    content: chunk.content,
+                    source: chunk.label,
+                    rank: -score, // negative so higher similarity = better (consistent with BM25)
+                    contentType: chunk.content_type,
+                    highlighted: chunk.content,
+                });
+            }
+        }
+        return results;
+    }
+    /**
+     * Hybrid search: combine BM25 and vector results using Reciprocal Rank Fusion.
+     * Falls back to BM25-only if no embeddings are available.
+     */
+    searchHybrid(bm25Results, vectorResults, limit = 3) {
+        const k = 60; // RRF constant
+        const scoreMap = new Map();
+        // Score BM25 results
+        for (let i = 0; i < bm25Results.length; i++) {
+            const key = `${bm25Results[i].source}:${bm25Results[i].title}`;
+            const rrfScore = 1 / (k + i + 1);
+            const existing = scoreMap.get(key);
+            if (existing) {
+                existing.score += rrfScore;
+            }
+            else {
+                scoreMap.set(key, { score: rrfScore, result: bm25Results[i] });
+            }
+        }
+        // Score vector results
+        for (let i = 0; i < vectorResults.length; i++) {
+            const key = `${vectorResults[i].source}:${vectorResults[i].title}`;
+            const rrfScore = 1 / (k + i + 1);
+            const existing = scoreMap.get(key);
+            if (existing) {
+                existing.score += rrfScore;
+            }
+            else {
+                scoreMap.set(key, { score: rrfScore, result: vectorResults[i] });
+            }
+        }
+        // Sort by combined RRF score, take top-k
+        return Array.from(scoreMap.values())
+            .sort((a, b) => b.score - a.score)
+            .slice(0, limit)
+            .map(entry => entry.result);
+    }
+    /**
+     * Check if any embeddings exist in the database.
+     */
+    hasEmbeddings() {
+        const row = this.#db.prepare("SELECT COUNT(*) as cnt FROM embeddings").get();
+        return row.cnt > 0;
     }
     // ── Sources ──
     listSources() {

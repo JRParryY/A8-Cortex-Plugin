@@ -14,6 +14,8 @@ import { readBashPolicies, evaluateCommandDenyOnly, extractShellCommands, readTo
 import { detectRuntimes, getRuntimeSummary, getAvailableLanguages, hasBunRuntime, } from "./runtime.js";
 import { classifyNonZeroExit } from "./exit-classify.js";
 import { startLifecycleGuard } from "./lifecycle.js";
+import { isCodeFile } from "./chunker-code.js";
+import { createEmbeddingClient } from "./embeddings.js";
 const VERSION = "0.1.0";
 // Prevent silent server death from unhandled async errors
 process.on("unhandledRejection", (err) => {
@@ -64,6 +66,14 @@ function getStore() {
         _store = new ContentStore();
     maybeIndexSessionEvents(_store);
     return _store;
+}
+// Lazy embedding client — only initialized when OPENROUTER_API_KEY is set
+let _embeddingClient = undefined;
+function getEmbeddingClient() {
+    if (_embeddingClient === undefined) {
+        _embeddingClient = createEmbeddingClient();
+    }
+    return _embeddingClient;
 }
 // ─────────────────────────────────────────────────────────
 // Session stats — track context consumption per tool
@@ -721,7 +731,22 @@ server.registerTool("cm_index", {
             catch { /* ignore — file read errors handled by store */ }
         }
         const store = getStore();
-        const result = store.index({ content, path, source });
+        // Route code files through tree-sitter semantic chunking
+        let result;
+        if (!content && path && isCodeFile(path)) {
+            result = await store.indexCode({ path, source });
+        }
+        else {
+            result = store.index({ content, path, source });
+        }
+        // Generate embeddings if OpenRouter key is configured
+        const embedClient = getEmbeddingClient();
+        if (embedClient) {
+            try {
+                await store.storeEmbeddings(result.sourceId, embedClient);
+            }
+            catch { /* embedding is best-effort */ }
+        }
         return trackResponse("cm_index", {
             content: [
                 {
@@ -819,7 +844,19 @@ server.registerTool("cm_search", {
                 sections.push(`## ${q}\n(output cap reached)\n`);
                 continue;
             }
-            const results = store.searchWithFallback(q, effectiveLimit, source);
+            let results = store.searchWithFallback(q, effectiveLimit, source);
+            // Hybrid search: merge with vector results if embeddings are available
+            const embedClient = getEmbeddingClient();
+            if (embedClient && store.hasEmbeddings()) {
+                try {
+                    const queryEmb = await embedClient.embedOne(q);
+                    const vectorResults = store.searchVector(queryEmb, effectiveLimit, source);
+                    if (vectorResults.length > 0) {
+                        results = store.searchHybrid(results, vectorResults, effectiveLimit);
+                    }
+                }
+                catch { /* vector search is best-effort */ }
+            }
             if (results.length === 0) {
                 sections.push(`## ${q}\nNo results found.`);
                 continue;
